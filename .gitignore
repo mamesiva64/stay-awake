@@ -1,0 +1,7 @@
+*.exe
+*.pdb
+dist/
+release/
+test-data/
+initial-*.txt
+pending.txt
