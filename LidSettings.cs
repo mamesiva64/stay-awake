@@ -8,6 +8,7 @@ interface ILidPower
     uint Read(Guid plan, bool battery);
     void Write(Guid plan, bool battery, uint value);
     void Activate(Guid plan);
+    bool CanHibernate();
 }
 
 sealed class WindowsLidPower : ILidPower
@@ -21,11 +22,12 @@ sealed class WindowsLidPower : ILidPower
     [DllImport("powrprof.dll")] static extern uint PowerWriteACValueIndex(IntPtr root, ref Guid plan, ref Guid sub, ref Guid key, uint value);
     [DllImport("powrprof.dll")] static extern uint PowerWriteDCValueIndex(IntPtr root, ref Guid plan, ref Guid sub, ref Guid key, uint value);
     [DllImport("powrprof.dll")] static extern uint PowerSetActiveScheme(IntPtr root, ref Guid plan);
+    [DllImport("powrprof.dll")] [return: MarshalAs(UnmanagedType.U1)] static extern bool GetPwrCapabilities(byte[] capabilities);
     static void Check(uint result)
     {
         if (result != 0) throw new InvalidOperationException(Ui.T(
-            "Windows の電源設定を操作できませんでした。エラー: ",
-            "Windows could not access the power setting. Error: ") + result);
+            "Windowsの電源設定を読み書きできませんでした。エラーコード: ",
+            "Could not read or change the Windows power setting. Error code: ") + result);
     }
     public Guid Active()
     {
@@ -47,6 +49,13 @@ sealed class WindowsLidPower : ILidPower
                       : PowerWriteACValueIndex(IntPtr.Zero, ref plan, ref subgroup, ref setting, value));
     }
     public void Activate(Guid plan) { Check(PowerSetActiveScheme(IntPtr.Zero, ref plan)); }
+    // SYSTEM_POWER_CAPABILITIES: byte 6 = SystemS4, byte 8 = HiberFilePresent. Windows hides Hibernate without both.
+    // If the query fails, offer Hibernate rather than hide a valid choice.
+    public bool CanHibernate()
+    {
+        var capabilities = new byte[76];
+        return !GetPwrCapabilities(capabilities) || (capabilities[6] != 0 && capabilities[8] != 0);
+    }
 }
 
 sealed class LidState
@@ -70,22 +79,22 @@ sealed class LidSettings
             "The power plan changed. Please try again."));
         return state;
     }
-    public void Set(LidState confirmed, bool keepRunning)
+    // Changes only one power source (plugged in or battery); the other is left as Windows has it.
+    // value: 0 = Do nothing, 1 = Sleep, 2 = Hibernate, 3 = Shut down.
+    public void Set(LidState confirmed, bool battery, uint value)
     {
         // The confirmation applies only to the plan and values the user actually saw.
         if (!Read().SameAs(confirmed)) throw new InvalidOperationException(Ui.T(
-            "確認中にOSの設定が変わりました。表示を確認してもう一度操作してください。",
+            "確認中にWindowsの設定が変わりました。表示を確認して、もう一度操作してください。",
             "Windows settings changed during confirmation. Review the current values and try again."));
-        uint value = keepRunning ? 0u : 1u;
-        // No saved previous state or automatic restore. On partial failure, the UI re-reads Windows.
-        power.Write(confirmed.Plan, false, value);
-        power.Write(confirmed.Plan, true, value);
+        // No saved previous state or automatic restore. On failure, the UI re-reads Windows.
+        power.Write(confirmed.Plan, battery, value);
         if (power.Active() != confirmed.Plan) throw new InvalidOperationException(Ui.T(
-            "変更中に電源プランが切り替わりました。変更対象のプランと現在の設定をWindowsで確認してください。",
+            "変更中に電源プランが切り替わりました。Windowsの電源オプションで、変更したプランと現在の設定を確認してください。",
             "The power plan changed while applying settings. Check the affected plan in Windows."));
         power.Activate(confirmed.Plan);
         LidState actual = Read();
-        if (actual.Plan != confirmed.Plan || actual.Ac != value || actual.Dc != value)
-            throw new InvalidOperationException(Ui.T("設定の反映を確認できませんでした。", "The setting could not be verified."));
+        if (actual.Plan != confirmed.Plan || (battery ? actual.Dc : actual.Ac) != value)
+            throw new InvalidOperationException(Ui.T("変更が反映されたことを確認できませんでした。", "Could not confirm that the change was applied."));
     }
 }

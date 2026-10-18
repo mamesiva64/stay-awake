@@ -8,9 +8,9 @@ using System.Windows.Forms;
 
 [assembly: AssemblyTitle("StayAwake")]
 [assembly: AssemblyDescription("Prevent idle sleep on Windows")]
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
-[assembly: AssemblyInformationalVersion("1.0.0")]
+[assembly: AssemblyVersion("1.1.0.0")]
+[assembly: AssemblyFileVersion("1.1.0.0")]
+[assembly: AssemblyInformationalVersion("1.1.0")]
 
 static class Ui
 {
@@ -29,16 +29,26 @@ static class Ui
     }
 }
 
-interface IAwakePower { bool Set(bool awake, bool display); }
+sealed class LidChoice
+{
+    public readonly uint Value;
+    public LidChoice(uint value) { Value = value; }
+    public override string ToString() { return Ui.ActionName(Value); }
+}
+
+interface IAwakePower { bool Set(bool awake, bool display); void DisplayOff(IntPtr window); }
 sealed class WindowsAwakePower : IAwakePower
 {
     [DllImport("kernel32.dll")] static extern uint SetThreadExecutionState(uint flags);
+    [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
     public bool Set(bool awake, bool display)
     {
         uint flags = 0x80000000;
         if (awake) flags |= 1u | (display ? 2u : 0u);
         return SetThreadExecutionState(flags) != 0;
     }
+    // WM_SYSCOMMAND / SC_MONITORPOWER / 2 = off. Mouse or keyboard input turns the display back on.
+    public void DisplayOff(IntPtr window) { SendMessage(window, 0x0112, (IntPtr)0xF170, (IntPtr)2); }
 }
 
 class MainForm : Form
@@ -47,102 +57,147 @@ class MainForm : Form
     readonly LidSettings lid;
     readonly IAwakePower power;
     readonly Func<string, bool> confirm;
+    readonly Func<string, bool> confirmExit;
     readonly Action<string> reportError;
     readonly Panel status = new Panel();
     readonly Label heading = new Label();
     readonly Label subtitle = new Label();
     internal readonly Button Toggle = new Button();
     internal readonly ComboBox Duration = new ComboBox();
+    internal readonly Button ScreenOff = new Button();
+    readonly Label screenOffHint = new Label();
     internal readonly CheckBox Display = new CheckBox();
-    internal readonly CheckBox Lid = new CheckBox();
-    internal readonly Label LidDescription = new Label();
+    internal readonly ComboBox LidAc = new ComboBox();
+    internal readonly ComboBox LidDc = new ComboBox();
+    readonly Label lidStatus = new Label();
     readonly Label remaining = new Label();
     readonly System.Windows.Forms.Timer tick = new System.Windows.Forms.Timer();
+    readonly System.Windows.Forms.Timer screenOffTimer = new System.Windows.Forms.Timer();
     bool awake = true;
+    bool changingLid;
     internal DateTime? Deadline { get; private set; }
+    internal int ScreenOffCountdown { get; private set; }
     int ticks;
-    public MainForm() : this(new WindowsLidPower(), new WindowsAwakePower(), null, null) { }
-    internal MainForm(ILidPower lidPower, IAwakePower awakePower, Func<string, bool> confirmation, Action<string> error)
+    public MainForm() : this(new WindowsLidPower(), new WindowsAwakePower(), null, null, null) { }
+    internal MainForm(ILidPower lidPower, IAwakePower awakePower, Func<string, bool> confirmation, Action<string> error,
+        Func<string, bool> exitConfirmation)
     {
         lid = new LidSettings(lidPower);
         power = awakePower;
         confirm = confirmation ?? delegate(string message) {
-            return MessageBox.Show(this, message, Ui.T("OSの電源設定を変更", "Change Windows power settings"),
+            return MessageBox.Show(this, message, Ui.T("Windowsの電源設定を変更", "Change Windows power settings"),
                 MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) == DialogResult.Yes;
+        };
+        confirmExit = exitConfirmation ?? delegate(string message) {
+            return MessageBox.Show(this, message, "StayAwake", MessageBoxButtons.OKCancel,
+                MessageBoxIcon.Information, MessageBoxDefaultButton.Button1) == DialogResult.OK;
         };
         reportError = error ?? delegate(string message) {
             MessageBox.Show(this, message, "StayAwake", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         };
-        Font = new Font(Ui.Japanese ? "Yu Gothic UI" : "Segoe UI", 10F);
+        Font = new Font(Ui.Japanese ? "Yu Gothic UI" : "Segoe UI", 9F);
         AutoScaleMode = AutoScaleMode.Font;
-        ClientSize = new Size(600, 490);
+        ClientSize = new Size(420, 372);
         FormBorderStyle = FormBorderStyle.FixedSingle;
         MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
         BackColor = Color.FromArgb(246, 248, 250);
         try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
 
-        status.SetBounds(0, 0, 600, 100);
+        // Compact status band: state on the first line, screen behavior below it.
+        status.SetBounds(0, 0, 420, 70);
         status.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
-        heading.SetBounds(20, 20, 560, 38);
-        heading.Font = new Font(Font.FontFamily, 19F, FontStyle.Bold);
-        heading.TextAlign = ContentAlignment.MiddleCenter;
+        heading.SetBounds(16, 10, 388, 28);
+        heading.Font = new Font(Font.FontFamily, 13F, FontStyle.Bold);
+        heading.TextAlign = ContentAlignment.MiddleLeft;
         heading.ForeColor = Color.White;
-        subtitle.SetBounds(20, 60, 560, 28);
-        subtitle.TextAlign = ContentAlignment.MiddleCenter;
+        subtitle.SetBounds(16, 40, 388, 20);
+        subtitle.TextAlign = ContentAlignment.MiddleLeft;
         subtitle.ForeColor = Color.White;
         status.Controls.Add(heading); status.Controls.Add(subtitle); Controls.Add(status);
 
-        Toggle.SetBounds(28, 120, 544, 48);
-        Toggle.Font = new Font(Font.FontFamily, 12F, FontStyle.Bold);
+        Toggle.SetBounds(16, 86, 388, 36);
+        Toggle.Font = new Font(Font.FontFamily, 10F, FontStyle.Bold);
         Toggle.UseVisualStyleBackColor = true;
         Toggle.Click += delegate { awake = !awake; SetDeadline(); ApplyAwake(); UpdateUi(); };
         Controls.Add(Toggle);
 
-        AddLabel(Ui.T("タイマーで解除：", "Turn off after:"), 28, 185, 144, 28);
-        Duration.SetBounds(174, 184, 126, 28);
+        AddLabel(this, Ui.T("自動で解除：", "Turn off after:"), 16, 138, 96, 24).TextAlign = ContentAlignment.MiddleLeft;
+        Duration.SetBounds(112, 138, 110, 24);
         Duration.DropDownStyle = ComboBoxStyle.DropDownList;
         Duration.Items.AddRange(new object[] {
-            Ui.T("無期限", "Never"), Ui.T("30分", "30 minutes"), Ui.T("1時間", "1 hour"),
-            Ui.T("2時間", "2 hours"), Ui.T("4時間", "4 hours"), Ui.T("8時間", "8 hours") });
+            Ui.T("しない", "Never"), Ui.T("30分後", "30 minutes"), Ui.T("1時間後", "1 hour"),
+            Ui.T("2時間後", "2 hours"), Ui.T("4時間後", "4 hours"), Ui.T("8時間後", "8 hours") });
         Duration.SelectedIndex = 0;
         Duration.SelectedIndexChanged += delegate { SetDeadline(); UpdateUi(); };
         Controls.Add(Duration);
-        remaining.SetBounds(314, 186, 258, 28);
+        remaining.SetBounds(232, 138, 172, 24);
+        remaining.TextAlign = ContentAlignment.MiddleLeft;
         remaining.ForeColor = Color.FromArgb(87, 96, 106);
         Controls.Add(remaining);
 
-        Label options = AddLabel(Ui.T("オプション", "Options"), 28, 232, 544, 28);
-        options.Font = new Font(Font.FontFamily, 10F, FontStyle.Bold);
-        Display.SetBounds(28, 266, 544, 32);
-        Display.Text = Ui.T("画面もつけたままにする（動画視聴、監視画面など）", "Keep the screen on (videos, monitoring, etc.)");
-        Display.Checked = true;
-        Display.CheckedChanged += delegate { ApplyAwake(); UpdateUi(); };
-        Controls.Add(Display);
+        ScreenOff.SetBounds(16, 172, 150, 28);
+        ScreenOff.UseVisualStyleBackColor = true;
+        ScreenOff.Click += delegate { ToggleScreenOff(); };
+        Controls.Add(ScreenOff);
+        screenOffHint.SetBounds(176, 172, 228, 28);
+        screenOffHint.TextAlign = ContentAlignment.MiddleLeft;
+        screenOffHint.ForeColor = Color.FromArgb(87, 96, 106);
+        Controls.Add(screenOffHint);
 
-        Lid.SetBounds(28, 308, 544, 46);
-        Lid.Text = Ui.T("ふたを閉じても動作を続ける（ノートPC用 ※電源設定を変更）",
-            "Keep running when the lid is closed\n(laptops; changes Windows power settings)");
-        Lid.ThreeState = true;
-        Lid.AutoCheck = false;
-        Lid.Click += delegate { ChangeLid(); };
-        Controls.Add(Lid);
-        LidDescription.SetBounds(48, 358, 524, 62);
-        LidDescription.ForeColor = Color.FromArgb(87, 96, 106);
-        Controls.Add(LidDescription);
-        AddLabel(Ui.T("終了するとスリープ抑止は解除されます。\nふたの電源設定は、タイマー解除・アプリ終了後も残ります。",
-            "Closing the app releases idle-sleep prevention.\nLid settings remain after the timer ends or the app closes."), 28, 433, 544, 48)
-            .ForeColor = Color.FromArgb(87, 96, 106);
+        // Options sit inside a frame; positions below are relative to the frame.
+        var options = new GroupBox { Text = Ui.T("オプション", "Options") };
+        options.SetBounds(16, 214, 388, 144);
+        options.Font = new Font(Font.FontFamily, 9F, FontStyle.Bold);
+        Controls.Add(options);
+        Display.SetBounds(12, 24, 364, 24);
+        Display.Text = Ui.T("画面もつけたままにする（動画視聴、監視画面など）", "Keep the screen on (videos, monitoring, etc.)");
+        Display.Checked = false;
+        Display.CheckedChanged += delegate { ApplyAwake(); UpdateUi(); };
+        options.Controls.Add(Display);
+
+        AddLabel(options, Ui.T("ノートPCを閉じたときの動作（Windowsの電源設定）",
+            "When I close the lid (Windows power setting)"), 12, 56, 364, 20);
+        bool hibernate = lidPower.CanHibernate();
+        AddLidRow(options, LidAc, Ui.T("電源接続時", "Plugged in"), 80, false, hibernate);
+        AddLidRow(options, LidDc, Ui.T("バッテリー駆動時", "On battery"), 110, true, hibernate);
+        lidStatus.SetBounds(284, 80, 96, 54);
+        lidStatus.ForeColor = Color.FromArgb(87, 96, 106);
+        options.Controls.Add(lidStatus);
+        // Only the frame caption is bold.
+        foreach (Control control in options.Controls) control.Font = Font;
 
         tick.Interval = 1000;
         tick.Tick += delegate { Pulse(DateTime.UtcNow); if (++ticks % 3 == 0) RefreshLid(); };
+        screenOffTimer.Interval = 1000;
+        screenOffTimer.Tick += delegate { ScreenOffTick(); };
         Activated += delegate { RefreshLid(); };
         ApplyAwake(); RefreshLid(); UpdateUi(); tick.Start();
     }
-    Label AddLabel(string text, int x, int y, int width, int height)
+    static Label AddLabel(Control parent, string text, int x, int y, int width, int height)
     {
         var label = new Label { Text = text };
-        label.SetBounds(x, y, width, height); Controls.Add(label); return label;
+        label.SetBounds(x, y, width, height); parent.Controls.Add(label); return label;
+    }
+    void AddLidRow(Control parent, ComboBox box, string text, int y, bool battery, bool hibernate)
+    {
+        AddLabel(parent, text, 24, y, 120, 24).TextAlign = ContentAlignment.MiddleLeft;
+        box.SetBounds(148, y, 130, 24);
+        box.DropDownStyle = ComboBoxStyle.DropDownList;
+        // Same choices as Windows Power Options; Hibernate only when this PC supports it.
+        foreach (uint value in new uint[] { 0, 1, 2, 3 })
+            if (value != 2 || hibernate) box.Items.Add(new LidChoice(value));
+        // SelectionChangeCommitted fires only for user changes, not when the app shows the Windows value.
+        box.SelectionChangeCommitted += delegate {
+            uint? value = Selected(box);
+            if (value.HasValue) ChangeLid(battery, value.Value);
+        };
+        parent.Controls.Add(box);
+    }
+    internal static uint? Selected(ComboBox box)
+    {
+        var choice = box.SelectedItem as LidChoice;
+        return choice == null ? (uint?)null : choice.Value;
     }
     void SetDeadline()
     {
@@ -161,74 +216,127 @@ class MainForm : Form
         {
             awake = false; Deadline = null;
             power.Set(false, false);
-            reportError(Ui.T("スリープ抑止を設定できませんでした。", "Could not set sleep prevention."));
+            reportError(Ui.T("スリープ防止を開始できませんでした。", "Could not start sleep prevention."));
         }
     }
     void UpdateUi()
     {
         status.BackColor = awake ? Color.FromArgb(35, 134, 54) : Color.FromArgb(110, 118, 129);
-        heading.Text = awake ? Ui.T("スリープを防止しています", "Keeping your PC awake") : Ui.T("通常のスリープ設定です", "Normal sleep settings");
-        subtitle.Text = awake ? (Display.Checked ? Ui.T("画面もつけたままにします", "The screen stays on too") : Ui.T("画面はOSの設定に従います", "The screen follows Windows settings"))
-            : Ui.T("無操作によるスリープを許可しています", "Idle sleep is allowed");
-        Toggle.Text = awake ? Ui.T("スリープ抑止を解除する", "Turn off sleep prevention") : Ui.T("スリープを防止する", "Prevent sleep");
-        remaining.Text = !awake ? "" : Deadline.HasValue
+        heading.Text = awake ? Ui.T("スリープを防止しています", "Keeping your PC awake") : Ui.T("スリープを防止していません", "Sleep prevention is off");
+        subtitle.Text = awake ? (Display.Checked ? Ui.T("画面もつけたままにします", "The screen stays on too") : Ui.T("画面はWindowsの設定どおりに消えます", "The screen turns off per Windows settings"))
+            : Ui.T("Windowsの設定どおりにスリープします", "Your PC sleeps per Windows settings");
+        Toggle.Text = awake ? Ui.T("スリープ防止を解除する", "Turn off sleep prevention") : Ui.T("スリープを防止する", "Prevent sleep");
+        ScreenOff.Text = ScreenOffCountdown > 0
+            ? Ui.T("画面を消します… " + ScreenOffCountdown, "Turning off in " + ScreenOffCountdown + "…")
+            : Ui.T("5秒後に画面を消す", "Turn off screen in 5 s");
+        screenOffHint.Text = ScreenOffCountdown > 0 ? Ui.T("もう一度クリックで中止", "Click again to cancel")
+            : Ui.T("マウスかキーボードの操作で戻ります", "Mouse or keyboard wakes it");
+        remaining.Text = awake && Deadline.HasValue
             ? Ui.T("残り ", "Remaining ") + TimeSpan.FromSeconds(Math.Max(0, Math.Ceiling((Deadline.Value - DateTime.UtcNow).TotalSeconds))).ToString(@"hh\:mm\:ss")
-            : Ui.T("手動で解除するまで", "Until turned off");
+            : "";
         Text = "StayAwake — " + Ui.T("スリープを防止", "Prevent sleep");
     }
+    internal void ToggleScreenOff()
+    {
+        ScreenOffCountdown = ScreenOffCountdown > 0 ? 0 : 5;
+        if (ScreenOffCountdown > 0) screenOffTimer.Start(); else screenOffTimer.Stop();
+        UpdateUi();
+    }
+    internal void ScreenOffTick()
+    {
+        if (ScreenOffCountdown == 0) return;
+        if (--ScreenOffCountdown == 0) screenOffTimer.Stop();
+        UpdateUi();
+        if (ScreenOffCountdown == 0) power.DisplayOff(Handle);
+    }
+    // Periodic refresh; skipped while a list is open or a change is being confirmed so it never fights the user.
     internal void RefreshLid()
+    {
+        if (!changingLid && !LidAc.DroppedDown && !LidDc.DroppedDown) ReadLid();
+    }
+    void ReadLid()
     {
         try
         {
             LidState state = lid.Read();
-            Lid.Enabled = true;
-            Lid.CheckState = state.Ac == 0 && state.Dc == 0 ? CheckState.Checked
-                : (state.Ac == 0 || state.Dc == 0 ? CheckState.Indeterminate : CheckState.Unchecked);
-            LidDescription.Text = Ui.T("OSの設定：電源接続時 ", "Windows: Plugged in — ") + Ui.ActionName(state.Ac)
-                + Ui.T(" ／ バッテリー時 ", " / On battery — ") + Ui.ActionName(state.Dc)
-                + "\n" + Ui.T("変更前の設定は保存しません。", "Previous settings are not saved.");
+            ShowLid(LidAc, state.Ac);
+            ShowLid(LidDc, state.Dc);
+            lidStatus.Text = "";
         }
         catch (Exception)
         {
-            Lid.Enabled = false; Lid.CheckState = CheckState.Indeterminate;
-            LidDescription.Text = Ui.T("OSのふたの設定を取得できません。\n非対応のPC、または権限・ポリシーの制限が考えられます。",
-                "Lid settings are unavailable. This PC may not support them,\nor access may be restricted by permissions or policy.");
+            LidAc.Enabled = LidDc.Enabled = false;
+            LidAc.SelectedIndex = LidDc.SelectedIndex = -1;
+            lidStatus.Text = Ui.T("Windowsの設定を読み取れません", "Can't read the Windows setting");
         }
     }
-    internal void ChangeLid()
+    // Shows the Windows value as is. A value missing from the list (e.g. Hibernate while unavailable) is added.
+    static void ShowLid(ComboBox box, uint action)
     {
+        box.Enabled = true;
+        if (Selected(box) == action) return;
+        int index = 0;
+        for (; index < box.Items.Count; index++)
+        {
+            uint value = ((LidChoice)box.Items[index]).Value;
+            if (value == action) { box.SelectedIndex = index; return; }
+            if (value > action) break;
+        }
+        box.Items.Insert(index, new LidChoice(action));
+        box.SelectedIndex = index;
+    }
+    internal void ChangeLid(bool battery, uint value)
+    {
+        changingLid = true;
         try
         {
             LidState state = lid.Read();
-            bool enable = !(state.Ac == 0 && state.Dc == 0);
-            string message = Ui.T("OSの設定を変更することになります。問題ないですか？", "This will change Windows power settings. Do you want to continue?")
-                + "\n\n" + Ui.T("現在：電源接続時 ", "Current: Plugged in — ") + Ui.ActionName(state.Ac)
-                + Ui.T(" ／ バッテリー時 ", " / On battery — ") + Ui.ActionName(state.Dc)
-                + "\n\n" + (enable
-                    ? Ui.T("ふたを閉じたときの動作を、電源接続時・バッテリー時とも『何もしない』にします。",
-                        "Set the lid-close action to 'Do nothing' for both plugged-in and battery power.")
-                    : Ui.T("ふたを閉じたときの動作を、電源接続時・バッテリー時とも『スリープ』にします。",
-                        "Set the lid-close action to 'Sleep' for both plugged-in and battery power."))
-                + "\n\n" + Ui.T("変更前の設定は保存しません。変更はタイマー解除・アプリ終了後も残ります。",
-                    "Previous settings will not be saved. Changes remain after the timer ends or the app closes.");
-            if (confirm(message)) lid.Set(state, enable);
+            uint current = battery ? state.Dc : state.Ac;
+            if (value == current) return;
+            string modeJa = battery ? "バッテリー駆動時" : "電源接続時", modeEn = battery ? "on battery" : "plugged in";
+            string message = Ui.T("Windowsの電源設定を変更します。よろしいですか？", "This will change a Windows power setting. Continue?")
+                + "\n\n" + Ui.T("カバーを閉じたときの動作（" + modeJa + "）", "When I close the lid (" + modeEn + ")")
+                + "\n" + Ui.T("　現在：", "   Current: ") + Ui.ActionName(current)
+                + "\n" + Ui.T("　変更後：", "   New: ") + Ui.ActionName(value)
+                + "\n\n" + Ui.T((battery ? "電源接続時" : "バッテリー駆動時") + "の設定は変更しません。",
+                    "The " + (battery ? "plugged-in" : "on-battery") + " setting is not changed.")
+                + "\n" + Ui.T("変更前の設定は保存されず、アプリを終了しても元に戻りません。",
+                    "The previous setting is not saved, and closing the app does not restore it.");
+            if (confirm(message)) lid.Set(state, battery, value);
         }
         catch (Exception ex)
         {
             reportError(ex.Message + "\n\n" + Ui.T(
-                "一部のみ変更された可能性があります。OSの現在値を再取得します。権限や会社のポリシーも確認してください。",
-                "Settings may have changed partially. Current Windows values will be refreshed. Check permissions or company policy."));
+                "表示をWindowsの現在の設定に更新します。変更できない場合は、権限や組織のポリシーを確認してください。",
+                "The window now shows the current Windows settings. If changes keep failing, check permissions or organization policy."));
         }
-        finally { RefreshLid(); }
+        // Always re-read Windows: on No or failure this puts the list back to the actual value.
+        finally { changingLid = false; ReadLid(); }
+    }
+    internal string ExitMessage()
+    {
+        string message = Ui.T("StayAwakeを終了しますか？", "Close StayAwake?") + "\n";
+        if (awake) message += "\n" + Ui.T("・スリープ防止は解除されます。", "• Sleep prevention will stop.");
+        message += "\n" + Ui.T("・カバーを閉じたときの動作は、今の設定のまま残ります。", "• The lid-close setting stays as it is.");
+        try
+        {
+            LidState state = lid.Read();
+            message += "\n" + Ui.T("　（電源接続時：", "   (Plugged in: ") + Ui.ActionName(state.Ac)
+                + Ui.T(" ／ バッテリー駆動時：", " / On battery: ") + Ui.ActionName(state.Dc) + Ui.T("）", ")");
+        }
+        catch (Exception) { }
+        return message;
     }
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
+        // Ask only when the user closes the window, not on Windows shutdown or sign-out.
+        if (e.CloseReason == CloseReason.UserClosing && !confirmExit(ExitMessage())) e.Cancel = true;
         base.OnFormClosing(e);
-        if (!e.Cancel) { tick.Stop(); power.Set(false, false); }
+        if (!e.Cancel) { tick.Stop(); screenOffTimer.Stop(); power.Set(false, false); }
     }
     protected override void Dispose(bool disposing)
     {
-        if (disposing) { tick.Dispose(); power.Set(false, false); }
+        if (disposing) { tick.Dispose(); screenOffTimer.Dispose(); power.Set(false, false); }
         base.Dispose(disposing);
     }
     [STAThread] static void Main(string[] args)
@@ -243,7 +351,7 @@ class MainForm : Form
         {
             if (!created)
             {
-                MessageBox.Show(Ui.T("StayAwake は既に起動しています。", "StayAwake is already running."), "StayAwake");
+                MessageBox.Show(Ui.T("StayAwakeはすでに起動しています。", "StayAwake is already running."), "StayAwake");
                 return;
             }
             Application.EnableVisualStyles();
